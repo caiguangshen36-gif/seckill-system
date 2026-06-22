@@ -12,6 +12,10 @@ import com.mvp.module.product.dto.ProductQueryRequest;
 import com.mvp.module.product.entity.Product;
 import com.mvp.module.product.mapper.ProductMapper;
 import com.mvp.module.product.vo.ProductVo;
+import jakarta.annotation.PostConstruct;
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.BeanUtils;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -20,6 +24,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.StringUtils;
 
+import java.io.Serializable;
 import java.util.List;
 
 @Slf4j
@@ -29,8 +34,44 @@ public class ProductService {
     @Autowired
     private ProductMapper productMapper;
 
+    private static final long ACTIVE_LIST_CACHE_TTL = 10;
+    private static final String ACTIVE_LIST_CACHE_KEY = "product:active:list";
+
     @Autowired
     private RedissonCacheService cacheService;
+
+    /**
+     * 应用启动时自动将 DB 库存同步到 Redis
+     */
+    @PostConstruct
+    public void warmupStock() {
+        log.info("开始Redis库存预热...");
+        List<Product> products = productMapper.selectList(null);
+        int count = 0;
+        for (Product p : products) {
+            if (p.getStatus() != null && p.getStatus() != 3) {
+                cacheService.setProductStock(p.getId(), p.getStockCount());
+                count++;
+            }
+        }
+        log.info("Redis库存预热完成，共预热 {} 个商品", count);
+    }
+
+    /**
+     * 应用启动时预热首页活动列表缓存，消除首次请求的 cache miss
+     */
+    @PostConstruct
+    public void warmupActiveListCache() {
+        log.info("开始预热活动列表缓存...");
+        int[] pageSizes = {5, 10, 20, 50};
+        for (int size : pageSizes) {
+            PageRequest pageRequest = new PageRequest();
+            pageRequest.setPageNum(1);
+            pageRequest.setPageSize(size);
+            listActiveProducts(pageRequest);
+        }
+        log.info("活动列表缓存预热完成，已预热 {} 种分页规格", pageSizes.length);
+    }
 
     public void addProduct(ProductDto dto) {
         if (dto.getStartTime() >= dto.getEndTime()) {
@@ -43,6 +84,7 @@ public class ProductService {
 
         cacheService.setProductStock(product.getId(), product.getStockCount());
         cacheService.invalidateProductCache(product.getId());
+        invalidateActiveListCache();
 
         log.info("添加秒杀商品成功：{}", dto.getGoodsName());
     }
@@ -66,6 +108,7 @@ public class ProductService {
 
         cacheService.setProductStock(id, dto.getStockCount());
         cacheService.invalidateProductCache(id);
+        invalidateActiveListCache();
 
         log.info("更新秒杀商品成功：{}", id);
     }
@@ -79,6 +122,7 @@ public class ProductService {
 
         cacheService.deleteProduct(id);
         cacheService.deleteProductStock(id);
+        invalidateActiveListCache();
         log.info("删除秒杀商品成功：{}", id);
     }
 
@@ -109,6 +153,17 @@ public class ProductService {
     }
 
     public IPage<ProductVo> listActiveProducts(PageRequest pageRequest) {
+        String cacheKey = ACTIVE_LIST_CACHE_KEY + ":" + pageRequest.getPageNum() + ":" + pageRequest.getPageSize();
+
+        Object cached = cacheService.get(cacheKey);
+        if (cached instanceof ActiveListCacheEntry entry) {
+            log.debug("从缓存获取进行中商品列表: page={}, size={}", pageRequest.getPageNum(), pageRequest.getPageSize());
+            Page<ProductVo> page = new Page<>(pageRequest.getPageNum(), pageRequest.getPageSize());
+            page.setRecords(entry.getRecords());
+            page.setTotal(entry.getTotal());
+            return page;
+        }
+
         long now = System.currentTimeMillis() / 1000;
         LambdaQueryWrapper<Product> wrapper = new LambdaQueryWrapper<>();
         wrapper.le(Product::getStartTime, now)
@@ -116,8 +171,18 @@ public class ProductService {
                .ge(Product::getStockCount, 1)
                .orderByDesc(Product::getId);
         Page<Product> page = new Page<>(pageRequest.getPageNum(), pageRequest.getPageSize());
-        IPage<Product> productPage = productMapper.selectPage(page, wrapper);
-        return productPage.convert(this::convertToVo);
+        IPage<ProductVo> result = productMapper.selectPage(page, wrapper).convert(this::convertToVo);
+
+        ActiveListCacheEntry entry = new ActiveListCacheEntry(result.getRecords(), result.getTotal());
+        cacheService.set(cacheKey, entry, ACTIVE_LIST_CACHE_TTL);
+        return result;
+    }
+
+    private void invalidateActiveListCache() {
+        cacheService.delete(ACTIVE_LIST_CACHE_KEY + ":1:5");
+        cacheService.delete(ACTIVE_LIST_CACHE_KEY + ":1:10");
+        cacheService.delete(ACTIVE_LIST_CACHE_KEY + ":1:20");
+        cacheService.delete(ACTIVE_LIST_CACHE_KEY + ":1:50");
     }
 
     public IPage<ProductVo> queryProducts(ProductQueryRequest request) {
@@ -142,23 +207,27 @@ public class ProductService {
 
     @Transactional(rollbackFor = Exception.class)
     public boolean decreaseStock(Long productId) {
-        Integer cachedStock = (Integer) cacheService.getProductStock(productId);
-        if (cachedStock != null && cachedStock <= 0) {
-            log.warn("缓存库存不足: productId={}", productId);
-            return false;
-        }
+        Integer cachedStock = cacheService.getProductStock(productId);
 
         if (cachedStock != null) {
-            boolean success = cacheService.decrementStock(productId);
-            if (!success) {
+            int luaResult = cacheService.checkAndDecrementStock(productId);
+            if (luaResult != 1) {
+                String reason = switch (luaResult) {
+                    case 0 -> "库存不足";
+                    case -1 -> "Redis key不存在";
+                    case -2 -> "库存校验冲突";
+                    default -> "未知错误";
+                };
+                log.warn("[Lua扣减失败] productId={}, result={}, reason={}", productId, luaResult, reason);
                 return false;
             }
         }
 
-        int result = productMapper.decreaseStock(productId);
-        if (result <= 0) {
+        int dbResult = productMapper.decreaseStock(productId);
+        if (dbResult <= 0) {
             if (cachedStock != null) {
                 cacheService.incrementStock(productId);
+                log.warn("[DB扣减失败-回滚Redis] productId={}", productId);
             }
             return false;
         }
@@ -240,5 +309,16 @@ public class ProductService {
             case 3 -> "已下架";
             default -> "未知";
         };
+    }
+
+    /**
+     * 活动列表缓存条目（替代无法序列化的 MyBatis-Plus IPage）
+     */
+    @Data
+    @NoArgsConstructor
+    @AllArgsConstructor
+    public static class ActiveListCacheEntry implements Serializable {
+        private List<ProductVo> records;
+        private long total;
     }
 }

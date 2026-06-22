@@ -55,7 +55,7 @@ public class ProductController {
     /**
      * 查询单个商品（高频接口，限流500/秒）
      */
-    @RateLimit(rate = 500, rateInterval = 1000, name = "product_detail")
+    @RateLimit(rate = 2000, rateInterval = 1000, name = "product_detail")
     @GetMapping("/detail")
     public Result<ProductVo> getProductById(@RequestParam Long id) {
         ProductVo product = productService.getProductById(id);
@@ -75,7 +75,7 @@ public class ProductController {
     /**
      * 分页查询进行中的商品（秒杀商品列表，限流300/秒）
      */
-    @RateLimit(rate = 300, rateInterval = 1000, name = "product_active")
+    @RateLimit(rate = 1000, rateInterval = 1000, name = "product_active")
     @PostMapping("/active")
     public Result<IPage<ProductVo>> listActiveProducts(@RequestBody PageRequest pageRequest) {
         IPage<ProductVo> page = productService.listActiveProducts(pageRequest);

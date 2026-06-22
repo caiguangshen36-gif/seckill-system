@@ -25,7 +25,7 @@ public class OrderController {
      * 秒杀下单接口
      * 限流配置：每秒最多100个请求（全局限流）
      */
-    @RateLimit(rate = 100, rateInterval = 1000, message = "秒杀人数过多，请稍后重试")
+    @RateLimit(rate = 1000, rateInterval = 1000, message = "秒杀人数过多，请稍后重试")
     @PostMapping
     public Result<OrderVo> createOrder(@RequestBody @Validated OrderDto dto) {
         OrderVo order = orderService.createOrder(dto);
