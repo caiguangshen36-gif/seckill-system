@@ -1,150 +1,97 @@
 # 高并发秒杀系统
 
-基于 **Spring Boot 3 + Vue 3** 的高并发秒杀系统，采用 Redis 原子化库存扣减、RabbitMQ 异步削峰、分布式限流等方案应对高并发场景。
-
-> **在线体验**: http://8.163.136.37 | 用户名: `xiongda` | 密码: `123456`
+基于 Spring Boot + Vue 3 的高并发秒杀系统，采用 Redis 缓存、Lua 脚本原子操作、RabbitMQ 消息队列、Redisson 分布式锁等技术解决秒杀场景下的库存超卖、高并发流量冲击等问题。
 
 ## 技术栈
 
-### 后端
-| 技术 | 说明 |
+| 层级 | 技术 |
 |------|------|
-| Spring Boot 3.2.0 | 核心框架 (Java 17) |
-| MyBatis-Plus 3.5.7 | ORM + 乐观锁 + 雪花算法 ID |
-| Spring Security + JWT | 无状态认证与鉴权 (jjwt 0.12.5 + java-jwt 4.4.0) |
-| Redis + Redisson 3.23.3 | 缓存 / Lua 原子脚本 / 分布式锁 / 限流 |
-| RabbitMQ (Spring AMQP) | 异步削峰 + 消息队列 |
-| MySQL 8.0 | 持久化存储 |
-| SpringDoc OpenAPI 2.2 | API 文档 |
-| Hutool 5.8 | 工具类库 |
-
-### 前端
-| 技术 | 说明 |
-|------|------|
-| Vue 3 (Composition API) | 前端框架 |
-| TypeScript ~6.0 | 类型安全 |
-| Element Plus 2.14 | UI 组件库 |
-| Pinia 3.0 + persistedstate | 状态管理 (持久化) |
-| Axios 1.16 | HTTP 请求封装 |
-| json-bigint | Snowflake ID 精度处理 |
-
-## 架构亮点
-
-### 解决超卖问题
-- **Redis Lua 脚本**：`check_and_decrement.lua` 原子 DECR + 负数自动回滚，再做 MySQL 乐观扣减（`WHERE stock_count > 0`），双重保障
-- **数据库唯一约束**：`(user_id, goods_id)` 联合唯一键防止重复下单
-- **Redis 库存预热**：`@PostConstruct` 启动时自动将 DB 库存同步到 Redis，消除冷启动穿透
-
-### 异步削峰
-- 订单创建后通过 **RabbitMQ** 异步发送消息，平滑流量尖峰
-- **`@Scheduled` 定时扫描**（每 30 秒）自动取消超时未支付订单并双恢复库存（Redis + DB）
-- 支付有效期 15 分钟（`PAY_EXPIRE_SECONDS = 900`）
-
-### 接口限流
-- 自定义 `@RateLimit` 注解 + AOP 切面，基于 Redis INCR 实现分布式滑动窗口
-- 下单接口限制 1000 QPS，管理接口限制 10 QPS。详见[核心接口](#核心接口)
-
-### 库存定时同步
-- `@Scheduled(fixedRate = 60000)` 每分钟将过期商品自动下架并清除缓存
-- `@PostConstruct` 启动时预热活动列表缓存（4 种分页规格），消除首个请求 cache miss
+| 后端框架 | Spring Boot 3.2、Spring Security、Spring AOP |
+| ORM | MyBatis-Plus 3.5.7（分页、乐观锁） |
+| 数据库 | MySQL 8.0 |
+| 缓存 & 分布式 | Redis（Redisson 3.23.3）、Lua 原子脚本 |
+| 消息队列 | RabbitMQ（死信队列处理超时订单） |
+| 认证 | JWT（jjwt 0.12.5）+ Redis Token 校验 |
+| 前端框架 | Vue 3 + Pinia + Vue Router 5 |
+| UI 组件库 | Element Plus |
+| 构建工具 | Vite 8、TypeScript 6 |
 
 ## 项目结构
 
 ```
 高并发秒杀系统/
-├── mvp_backend/                    # Spring Boot 后端
-│   ├── src/main/java/com/mvp/
-│   │   ├── common/
-│   │   │   ├── annotation/         # @RateLimit 限流注解
-│   │   │   ├── aspect/             # AOP 切面实现
-│   │   │   ├── config/             # Redis/RabbitMQ/Redisson 配置
-│   │   │   ├── dto/                # 通用 DTO（分页请求等）
-│   │   │   ├── exption/            # 全局异常处理 & 业务异常
-│   │   │   ├── mq/                 # 消息生产者 & 消费者
-│   │   │   └── utils/              # 工具类（RedissonCacheService、ThreadLocalUtil、JWT）
-│   │   ├── module/
-│   │   │   ├── user/               # 用户模块 (注册/登录)
-│   │   │   ├── product/            # 商品模块 (CRUD/秒杀列表/库存)
-│   │   │   └── order/              # 订单模块 (秒杀下单/取消/查询/超时扫描)
-│   │   └── security/               # JWT 认证 & Security 配置
-│   └── src/main/resources/
-│       ├── lua/                    # 5 个 Redis Lua 原子脚本
-│       ├── sql/database.sql        # 建表 & 种子数据
-│       ├── application.yaml        # 本地环境配置
-│       └── application-docker.yaml # Docker 环境配置
-├── mvp_frontend/                   # Vue 3 前端
-│   ├── src/
-│   │   ├── views/
-│   │   │   ├── Login.vue           # 登录 / 注册
-│   │   │   ├── Layout.vue          # 导航框架
-│   │   │   ├── SeckillGoods.vue    # 秒杀商品列表 (核心页面)
-│   │   │   ├── Orders.vue          # 订单中心 (实时倒计时)
-│   │   │   └── Goods.vue           # 商品管理 CRUD
-│   │   ├── stores/                 # Pinia 状态管理
-│   │   ├── api/                    # 接口封装
-│   │   ├── components/             # 公共组件
-│   │   ├── utils/                  # Axios 封装 (request.js)
-│   │   └── router/                 # 路由配置
-│   ├── nginx.conf                  # Nginx 配置 (Docker 部署)
-│   └── Dockerfile                  # 前端镜像构建
-├── docker-compose.yml              # 一键编排 (MySQL + Redis + RabbitMQ + 后端 + 前端)
-├── Docker部署指南.md                # 详细部署文档
-├── 压测总结报告.md                  # 压测完整报告
-├── 性能优化记录.md                  # 优化过程详细记录
-└── README.md
+├── mvp_backend/                  # Spring Boot 后端
+│   └── src/main/java/com/mvp/
+│       ├── common/               # 公共组件（配置、注解、切面、工具类、MQ、异常处理）
+│       ├── module/
+│       │   ├── user/             # 用户模块（登录/注册）
+│       │   ├── product/          # 商品模块（CRUD、库存管理、定时任务）
+│       │   └── order/            # 订单模块（秒杀下单、取消、超时处理）
+│       ├── security/             # Spring Security + JWT 过滤器
+│       └── test/                 # 测试数据初始化
+├── mvp_frontend/                 # Vue 3 前端
+│   └── src/
+│       ├── api/                  # Axios 接口封装
+│       ├── router/               # Vue Router 路由
+│       ├── stores/               # Pinia 状态管理
+│       ├── utils/                # 请求拦截器（JWT、JSONbig）
+│       └── views/                # 页面组件
+├── Phase1_压测报告.pdf            # 压测报告
+├── Phase2_压测报告.pdf            # 压测报告
+├── Phase3_压测报告.pdf            # 压测报告
+├── 压测总结报告.pdf               # 压测报告
+└── 性能优化记录.pdf               # 压测报告
 ```
 
-## 秒杀核心流程
+## 核心功能
+
+- **用户模块**：注册、登录（BCrypt + JWT 无状态认证）
+- **商品管理**：秒杀商品 CRUD、活动时间管理、过期商品自动下架（定时任务）
+- **秒杀下单**：Redis 预扣库存 → Lua 脚本原子扣减 → 数据库兜底扣减 → 防重复购买
+- **订单管理**：订单查询、主动取消、超时自动取消（RabbitMQ 死信队列）
+- **接口限流**：自定义 `@RateLimit` 注解 + Redis INCR 计数器实现分布式限流
+
+## 秒杀核心技术方案
 
 ```
-用户请求 → @RateLimit 限流 (1000 QPS) → JWT 认证
-  → 验证秒杀时间窗口 → 防重复购买 (uk_user_goods)
-  → Redis Lua 原子扣减 (checkAndDecrementStock, 负数自动回滚)
-  → MySQL 库存乐观扣减 (WHERE stock_count > 0)
-  → 雪花算法生成订单号 → RabbitMQ 异步消息
-  → 订单进入待支付状态 (status=0, 15分钟支付窗口)
-  → @Scheduled 每30秒扫描超时订单 → 自动取消并双恢复库存 (Redis + DB)
+请求 → @RateLimit 接口限流
+     → 校验秒杀时间 & 用户购买记录
+     → Redis Lua 脚本原子扣减库存（防超卖）
+     → 数据库写入订单（兜底）
+     → RabbitMQ 发送消息（异步处理 + 超时取消）
 ```
 
-## 快速启动
+- **防超卖**：Redis 缓存库存 + Lua 原子预扣 + DB 行级 `UPDATE WHERE stock_count > 0` 兜底
+- **防重复购买**：DB 唯一索引 `uk_user_goods` + Redis 用户购买记录
+- **流量削峰**：接口限流 + 消息队列异步解耦
+- **超时处理**：订单队列 TTL 10 分钟 → 死信队列 → 自动取消 + 恢复库存
+
+## 快速开始
 
 ### 环境要求
-- JDK 17
-- Maven 3.8+
-- Node.js `^20.19.0 || >=22.12.0`
-- MySQL 8.0
-- Redis 7.0+
-- RabbitMQ 3.12+
 
-### 方式一：Docker Compose 一键部署（推荐）
+- JDK 17、Maven 3.8+
+- MySQL 8.0、Redis、RabbitMQ 3.x
+- Node.js >= 20.19
 
-```bash
-cd mvp
-docker compose up -d --build
-```
+### 1. 初始化数据库
 
-首次构建约 5-10 分钟。完成后访问 `http://localhost`（前端）和 `http://localhost:8080/doc.html`（API 文档）。
+执行 `mvp_backend/src/main/resources/sql/database.sql` 创建库表及 20 条测试商品数据。
 
-前置条件：服务器内存 ≥ 4GB，安装 Docker + Docker Compose。详见 [Docker部署指南.md](./Docker部署指南.md)。
+### 2. 修改配置
 
-### 方式二：本地开发
+编辑 `mvp_backend/src/main/resources/application.yaml`，修改数据库、Redis、RabbitMQ 的连接信息。
 
-#### 1. 初始化数据库
-
-执行 `mvp_backend/src/main/resources/sql/database.sql` 创建库表并导入种子数据。
-
-#### 2. 启动后端
+### 3. 启动后端
 
 ```bash
 cd mvp_backend
-# 修改 src/main/resources/application.yaml 中的数据库、Redis、RabbitMQ 连接信息
-# RabbitMQ 默认凭据: user=cai_shen, password=123456
-./mvnw spring-boot:run
+mvn spring-boot:run
 ```
 
-服务启动在 `http://localhost:8080`，API 文档：`http://localhost:8080/doc.html`
+后端默认运行在 `http://localhost:8080`。
 
-#### 3. 启动前端
+### 4. 启动前端
 
 ```bash
 cd mvp_frontend
@@ -152,23 +99,7 @@ npm install
 npm run dev
 ```
 
-前端启动在 `http://localhost:5173`，开发模式下自动代理 API 请求到后端。
-
-## 核心接口
-
-| 接口 | 方法 | 说明 | 限流 |
-|------|------|------|------|
-| `/user/login` | POST | 用户登录 | 无需认证 |
-| `/user/register` | POST | 用户注册 | 无需认证 |
-| `/product/detail` | GET | 商品详情（带缓存） | 2000 QPS |
-| `/product/active` | POST | 活跃秒杀商品列表（Redis 缓存 TTL 10s） | 1000 QPS |
-| `/product/list` | POST | 全部商品列表 | 200 QPS |
-| `/product/stock` | GET | 查询商品库存 | 500 QPS |
-| `/order` | POST | 秒杀下单 | 1000 QPS |
-| `/order/list` | POST | 我的订单 | 100 QPS |
-| `/order/cancel` | POST | 取消订单 | 50 QPS |
-
-> 注：以上限流值经 Phase 1-3 压测验证调整。`/product/add`、`/product/update`、`/product/delete` 管理接口限流 10 QPS。
+前端默认运行在 `http://localhost:5173`，通过 Vite 代理将 `/api` 请求转发到后端 8080 端口。
 
 ## 压测与性能验证
 
@@ -190,7 +121,7 @@ npm run dev
 | 重复订单 | 0 | 0 | 0 | 0 |
 | Redis/DB 偏差 | 0 | 0 | 0 | 0 |
 
-### 瓶颈发现与修复（6 个缺陷全部修复）
+### 瓶颈发现与修复
 
 ```
 Phase 1 初测 → 瓶颈: 限流层 (100/s)
@@ -212,9 +143,9 @@ Phase 3 → 瓶颈: DB 连接池竞争 (总 QPS ~670 @ c≥500)
 | 1 | Phase 1 | `/order` 限流 100/s 导致 c≥50 成功率 0% | 🔴 | 上调至 1000/s | 5,115→0 次限流拦截 |
 | 2 | Phase 1 | `/product/active` 无缓存 P99 飙至 1308ms | 🔴 | Redis 缓存 TTL 10s + 启动预热 | 缓存命中响应 123ms→23ms (**5.3x**) |
 | 3 | Phase 1 | Redis 库存键缺失，Lua 扣减形同虚设 | 🟡 | `@PostConstruct` 启动自动预热 | 20 商品自动同步 |
-| 4 | Phase 1 | 热路径用简单 DECR（GET→检查→DECR 非原子） | 🟡 | 改用 `checkAndDecrementStock` | DECR+负数自动回滚，消除超卖风险 |
+| 4 | Phase 1 | 热路径用简单 DECR（GET→检查→DECR 非原子） | 🟡 | 改用 `checkAndDecrementStock` | DECR+负数自动回滚 |
 | 5 | Phase 1 | 订单初始状态错标为"已支付" (status=1) | 🟡 | 修正为 status=0（待支付） | 订单生命周期完整 |
-| 6 | Phase 3 | MQ 死信队列 **0 条消息**，超时订单永不取消 | 🔴 | `@Scheduled(fixedRate=30000)` 替代 | 超时订单 ≤30s 自动取消+双恢复库存 |
+| 6 | Phase 3 | MQ 死信队列 0 条消息，超时订单永不取消 | 🔴 | `@Scheduled(fixedRate=30000)` 替代 | 超时订单 ≤30s 自动取消 |
 
 ### 长时稳定性验证（Phase 3）
 
@@ -242,16 +173,34 @@ Phase 3 → 瓶颈: DB 连接池竞争 (总 QPS ~670 @ c≥500)
 └─────────────────────────────────────────────────────┘
 ```
 
-> 详细优化过程见：[性能优化记录.md](./性能优化记录.md) | [Phase1](./Phase1_压测报告.md) | [Phase2](./Phase2_压测报告.md) | [Phase3](./Phase3_压测报告.md)
+## 压测报告详情
 
-## 待优化项
+以下为各阶段完整压力测试报告 PDF 文档：
 
-| 项目 | 优先级 | 说明 |
-|------|--------|------|
-| DB 连接池优化 | P1 | HikariCP `maximumPoolSize` 当前默认 10，c≥500 时 P99 由连接池竞争决定，建议增大到 20-30 |
-| `pay_expire_time` 加复合索引 | P1 | `WHERE status=0 AND pay_expire_time < ?` 提升定时扫描效率 |
-| Prometheus + Grafana 监控 | P2 | 实时监控连接池、GC、QPS、P99，替代脚本监控 |
-| 读写分离 | P2 | `/product/detail`、`/product/active` 等读接口走从库 |
-| 限流器升级为滑动窗口 | P3 | 当前 INCR+固定 TTL 存在窗口边界误杀风险，可升级为 Redisson RRateLimiter |
-| MQ 流程重构 | P3 | 考虑将 `handleOrderCreate` 改为延迟消费，或移除冗余的 MQ 创建消息路径 |
-| 前端增加图片/商品详情页 | P3 | 提升用户体验 |
+| 文档 | 说明 |
+|------|------|
+| [Phase1 压测报告](./Phase1_压测报告.pdf) | 第一阶段基准压测：裸机单服务 + 基础接口性能基线 |
+| [Phase2 压测报告](./Phase2_压测报告.pdf) | 第二阶段压测：引入缓存、Lua 原子操作后的性能对比 |
+| [Phase3 压测报告](./Phase3_压测报告.pdf) | 第三阶段压测：完整方案（限流 + MQ + 分布式锁）验证 |
+| [压测总结报告](./压测总结报告.pdf) | 三阶段横向对比总结，系统吞吐量 QPS 提升分析 |
+| [性能优化记录](./性能优化记录.pdf) | 关键优化点详细记录：SQL、Redis、JVM 参数调优过程 |
+
+> 压测工具：JMeter，包含详细 QPS、RT、错误率、系统资源监控数据。
+
+## 接口文档
+
+项目集成 SpringDoc OpenAPI，启动后端后访问：`http://localhost:8080/swagger-ui.html`
+
+API 统一返回格式：
+
+```json
+{
+  "code": 200,
+  "message": "success",
+  "data": {}
+}
+```
+
+
+
+
