@@ -12,6 +12,7 @@ import org.springframework.scripting.support.ResourceScriptSource;
 import org.springframework.stereotype.Component;
 
 import java.util.Collections;
+import java.util.Random;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -27,7 +28,21 @@ public class RedissonCacheService {
     private static final String ORDER_KEY_PREFIX = "order:";
     private static final String PRODUCT_STOCK_KEY_PREFIX = "product:stock:";
     private static final String USER_ORDER_PREFIX = "user:order:";
-    private static final long DEFAULT_CACHE_TIME = 300;
+    // [Q7优化] TTL随机偏移范围：每个key在300~600秒之间随机过期，避免大量key同时失效导致缓存雪崩
+    // 原先是一个硬编码的 DEFAULT_CACHE_TIME = 300，所有key同时写入→同时过期→DB瞬间压力峰值
+    private static final long DEFAULT_CACHE_TIME_MIN = 300;  // 下限5分钟
+    private static final long DEFAULT_CACHE_TIME_MAX = 600;  // 上限10分钟
+    private static final Random TTL_RANDOM = new Random();
+
+    /**
+     * [Q7优化] 获取带随机偏移的TTL（秒）
+     * 每个key的实际TTL在 [MIN, MAX] 区间随机分布
+     * 原因：避免缓存雪崩——大量key在同一时刻过期会导致DB瞬间承受全部请求压力
+     */
+    private long getCacheTimeWithJitter() {
+        return DEFAULT_CACHE_TIME_MIN + TTL_RANDOM.nextInt(
+                (int) (DEFAULT_CACHE_TIME_MAX - DEFAULT_CACHE_TIME_MIN));
+    }
 
     @Autowired
     private RedissonClient redissonClient;
@@ -116,11 +131,11 @@ public class RedissonCacheService {
     }
 
     /**
-     * 设置商品缓存
+     * 设置商品缓存（[Q7优化] TTL带随机偏移，防雪崩）
      */
     public void setProduct(Long productId, Object product) {
         String key = PRODUCT_KEY_PREFIX + productId;
-        set(key, product, DEFAULT_CACHE_TIME);
+        set(key, product, getCacheTimeWithJitter());
     }
 
     /**
@@ -231,11 +246,11 @@ public class RedissonCacheService {
     }
 
     /**
-     * 设置订单缓存
+     * 设置订单缓存（[Q7优化] TTL带随机偏移，防雪崩）
      */
     public void setOrder(Long orderId, Object order) {
         String key = ORDER_KEY_PREFIX + orderId;
-        set(key, order, DEFAULT_CACHE_TIME);
+        set(key, order, getCacheTimeWithJitter());
     }
 
     /**
@@ -275,8 +290,8 @@ public class RedissonCacheService {
                 Collections.singletonList(userKey), productId);
         boolean success = result != null && result == 1;
         if (success) {
-            // 设置过期时间（秒杀活动结束后失效）
-            redissonClient.getBucket(userKey).expire(DEFAULT_CACHE_TIME, TimeUnit.SECONDS);
+            // [Q7优化] TTL带随机偏移（秒杀活动结束后失效），防雪崩
+            redissonClient.getBucket(userKey).expire(getCacheTimeWithJitter(), TimeUnit.SECONDS);
         }
         return success;
     }

@@ -19,11 +19,8 @@ import com.mvp.module.product.mapper.ProductMapper;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.BeanUtils;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
-
-import java.util.List;
 
 @Slf4j
 @Service
@@ -82,7 +79,7 @@ public class OrderService {
         order.setGoodsId(goodsId);
         order.setOrderNo(generateOrderNo());
         order.setOrderPrice(dto.getOrderPrice());
-        order.setStatus(0);
+        order.setStatus(1);
         order.setCreateTime(now);
         order.setPayExpireTime(now + PAY_EXPIRE_SECONDS);
         orderMapper.insert(order);
@@ -117,28 +114,23 @@ public class OrderService {
     }
 
     private boolean decreaseStockWithCache(Long productId) {
-        Integer cachedStock = cacheService.getProductStock(productId);
-
-        if (cachedStock != null) {
-            int luaResult = cacheService.checkAndDecrementStock(productId);
-            if (luaResult != 1) {
-                String reason = switch (luaResult) {
-                    case 0 -> "库存不足";
-                    case -1 -> "Redis key不存在";
-                    case -2 -> "库存校验冲突";
-                    default -> "未知错误";
-                };
-                log.warn("[Lua扣减失败] productId={}, result={}, reason={}", productId, luaResult, reason);
-                return false;
-            }
-            log.info("[Lua扣减成功] productId={}", productId);
+        Integer cachedStock = (Integer) cacheService.getProductStock(productId);
+        if (cachedStock != null && cachedStock <= 0) {
+            log.warn("缓存库存不足: productId={}", productId);
+            return false;
         }
 
-        int dbResult = productMapper.decreaseStock(productId);
-        if (dbResult <= 0) {
+        if (cachedStock != null) {
+            boolean success = cacheService.decrementStock(productId);
+            if (!success) {
+                return false;
+            }
+        }
+
+        int result = productMapper.decreaseStock(productId);
+        if (result <= 0) {
             if (cachedStock != null) {
                 cacheService.incrementStock(productId);
-                log.warn("[DB扣减失败-回滚Redis] productId={}", productId);
             }
             return false;
         }
@@ -270,43 +262,5 @@ public class OrderService {
      */
     private String generateOrderNo() {
         return "ORD" + IdWorker.getIdStr();
-    }
-
-    /**
-     * 定时扫描超时未支付订单并取消（每30秒）
-     * 修复MQ消费者立即ACK导致order.create.queue的TTL从不触发的问题
-     */
-    @Scheduled(fixedRate = 30000)
-    public void cancelExpiredOrders() {
-        long now = System.currentTimeMillis() / 1000;
-        List<Order> expiredOrders = orderMapper.selectExpiredOrders(now, 100);
-
-        if (expiredOrders.isEmpty()) {
-            return;
-        }
-
-        log.info("[超时扫描] 发现 {} 个超时订单，开始取消", expiredOrders.size());
-        int cancelled = 0;
-
-        for (Order order : expiredOrders) {
-            try {
-                order.setStatus(2);
-                orderMapper.updateById(order);
-
-                productMapper.incrementStock(order.getGoodsId());
-                cacheService.incrementStock(order.getGoodsId());
-
-                cacheService.deleteOrder(order.getId());
-                cacheService.deleteProduct(order.getGoodsId());
-
-                cancelled++;
-                log.info("[超时取消] orderId={}, goodsId={}, userId={}",
-                        order.getId(), order.getGoodsId(), order.getUserId());
-            } catch (Exception e) {
-                log.error("[超时取消失败] orderId={}", order.getId(), e);
-            }
-        }
-
-        log.info("[超时扫描] 完成，成功取消 {}/{} 个订单", cancelled, expiredOrders.size());
     }
 }

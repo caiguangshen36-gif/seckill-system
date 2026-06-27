@@ -22,7 +22,7 @@ public class RedissonConfig {
     @Bean(destroyMethod = "shutdown")
     public RedissonClient redissonClient() {
         Config config = new Config();
-
+        
         // 单节点模式配置
         config.useSingleServer()
               .setAddress("redis://" + redisHost + ":" + redisPort)
